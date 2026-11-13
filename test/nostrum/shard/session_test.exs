@@ -69,10 +69,35 @@ defmodule Nostrum.Shard.SessionTest do
       assert %{conn: nil, stream: nil, seq: 42, session: "session-id"} = new_data
     end
 
-    test "connects again later when the gateway rejects the upgrade", %{data: data} do
-      message = {:gun_response, data.conn, data.stream, :nofin, 503, []}
+    test "connects again after retry-after when the gateway rejects the upgrade", %{data: data} do
+      # What Cloudflare sent in front of the gateway when this crashed in production.
+      headers = [
+        {"content-length", "19"},
+        {"connection", "keep-alive"},
+        {"retry-after", "5"},
+        {"server", "cloudflare"}
+      ]
 
-      assert {:next_state, :disconnected, %{conn: nil, seq: 42}, {:state_timeout, _, :connect}} =
+      message = {:gun_response, data.conn, data.stream, :nofin, 503, headers}
+
+      assert {:next_state, :disconnected, %{conn: nil, seq: 42, session: "session-id"},
+              {:state_timeout, 5_000, :connect}} =
+               Session.connecting_ws(:info, message, data)
+    end
+
+    test "uses the default delay when retry-after is missing or not seconds", %{data: data} do
+      for headers <- [[], [{"retry-after", "Fri, 13 Nov 2026 18:02:12 GMT"}]] do
+        message = {:gun_response, data.conn, data.stream, :nofin, 503, headers}
+
+        assert {:next_state, :disconnected, _, {:state_timeout, 1_000, :connect}} =
+                 Session.connecting_ws(:info, message, data)
+      end
+    end
+
+    test "does not wait longer than 30 seconds for retry-after", %{data: data} do
+      message = {:gun_response, data.conn, data.stream, :nofin, 503, [{"retry-after", "3600"}]}
+
+      assert {:next_state, :disconnected, _, {:state_timeout, 30_000, :connect}} =
                Session.connecting_ws(:info, message, data)
     end
 

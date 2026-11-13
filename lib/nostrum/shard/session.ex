@@ -97,6 +97,9 @@ defmodule Nostrum.Shard.Session do
   # How long to wait before connecting again when the connection failed while
   # it was being set up (e.g. it went down during the websocket upgrade).
   @retry_connect_delay :timer.seconds(1)
+  # Upper bound for a `retry-after` the gateway asks us to wait. Discord only
+  # lets us resume a session for a limited time, so don't wait forever.
+  @max_retry_connect_delay :timer.seconds(30)
   # Messages `:gun` sends to the owner of a connection. The second element is
   # always the connection pid.
   @gun_messages [
@@ -391,13 +394,14 @@ defmodule Nostrum.Shard.Session do
   end
 
   # The gateway answered the upgrade request with a plain HTTP response
-  # instead of switching protocols (e.g. a 5xx while Discord is having issues).
+  # instead of switching protocols (e.g. a 503 from Cloudflare while Discord
+  # is having issues). Wait as long as it asks us to in `retry-after`.
   def connecting_ws(
         :info,
-        {:gun_response, conn, _stream, _fin, status, _headers},
+        {:gun_response, conn, _stream, _fin, status, headers},
         %{conn: conn} = data
       ) do
-    retry_connect(data, {:upgrade_rejected, status})
+    retry_connect(data, {:upgrade_rejected, status}, retry_after(headers))
   end
 
   def connecting_ws(:state_timeout, :upgrade_timeout, _data) do
@@ -558,15 +562,31 @@ defmodule Nostrum.Shard.Session do
 
   # Throw away the connection we were setting up and try again after a short
   # delay. We keep `seq` and `session`, so we will RESUME instead of IDENTIFY.
-  defp retry_connect(%{conn: conn} = data, reason) do
+  defp retry_connect(%{conn: conn} = data, reason, delay \\ @retry_connect_delay) do
     Logger.warning(
       "Shard connection failed while connecting (#{inspect(reason)}), " <>
-        "retrying in #{@retry_connect_delay}ms"
+        "retrying in #{delay}ms"
     )
 
     close_connection(conn)
-    retry = {:state_timeout, @retry_connect_delay, :connect}
+    retry = {:state_timeout, delay, :connect}
     {:next_state, :disconnected, %{data | conn: nil, stream: nil}, retry}
+  end
+
+  # How long to wait before connecting again, from the `retry-after` header
+  # (in seconds) of a rejected upgrade. Falls back to the default delay when
+  # the header is missing or not a number of seconds (it may be an HTTP date),
+  # and never waits longer than `@max_retry_connect_delay`.
+  defp retry_after(headers) do
+    with {_name, value} <- List.keyfind(headers, "retry-after", 0),
+         {seconds, ""} when seconds >= 0 <- Integer.parse(String.trim(value)) do
+      seconds
+      |> :timer.seconds()
+      |> max(@retry_connect_delay)
+      |> min(@max_retry_connect_delay)
+    else
+      _ -> @retry_connect_delay
+    end
   end
 
   defp stop_with_resume_information(from, %{
