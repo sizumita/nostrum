@@ -94,6 +94,32 @@ defmodule Nostrum.Shard.Session do
   @standard_flow 10
   # Requests that can be sent from a user via `:cast` messages.
   @user_requests [:status_update, :update_voice_state, :request_guild_members]
+  # How long to wait before connecting again when the connection failed while
+  # it was being set up (e.g. it went down during the websocket upgrade).
+  @retry_connect_delay :timer.seconds(1)
+  # Messages `:gun` sends to the owner of a connection. The second element is
+  # always the connection pid.
+  @gun_messages [
+    :gun_up,
+    :gun_down,
+    :gun_error,
+    :gun_response,
+    :gun_inform,
+    :gun_data,
+    :gun_trailers,
+    :gun_push,
+    :gun_upgrade,
+    :gun_ws,
+    :gun_notify,
+    :gun_tunnel_up
+  ]
+
+  # A `:gun` message from a connection that is no longer ours, e.g. the
+  # connection we gave up on after a missed heartbeat ack. Its messages can
+  # arrive in any state and must not crash the session.
+  defguardp is_stale_gun_message(message, conn)
+            when is_tuple(message) and tuple_size(message) >= 2 and
+                   elem(message, 0) in @gun_messages and elem(message, 1) != conn
 
   def update_status(pid, status, activity) do
     {idle_since, afk} =
@@ -209,9 +235,23 @@ defmodule Nostrum.Shard.Session do
     {:next_state, :connecting_http, data}
   end
 
-  # def disconnected(_kind, _request, _data) do
-  #  {:keep_state_and_data, :postpone}
-  # end
+  # The connection failed while it was being set up. We wait a moment before
+  # trying again so that we don't hammer the gateway.
+  def disconnected(:state_timeout, :connect, data) do
+    {:next_state, :connecting_http, data}
+  end
+
+  def disconnected(:info, message, %{conn: conn}) when is_stale_gun_message(message, conn) do
+    :keep_state_and_data
+  end
+
+  def disconnected(:cast, {request, _payload}, _data) when request in @user_requests do
+    {:keep_state_and_data, :postpone}
+  end
+
+  def disconnected({:call, from}, {:disconnect, nil}, data) do
+    stop_with_resume_information(from, data)
+  end
 
   # If we've been here before, we want to use the resume gateway URL to connect
   # instead of the regular gateway URL.
@@ -251,8 +291,28 @@ defmodule Nostrum.Shard.Session do
     {:stop, :connect_http_timeout}
   end
 
+  def connecting_http(:info, message, %{conn: conn}) when is_stale_gun_message(message, conn) do
+    :keep_state_and_data
+  end
+
+  def connecting_http(
+        :info,
+        {:gun_down, conn, _proto, reason, _killed_streams},
+        %{conn: conn} = data
+      ) do
+    retry_connect(data, {:gun_down, reason})
+  end
+
+  def connecting_http(:info, {:gun_error, conn, reason}, %{conn: conn} = data) do
+    retry_connect(data, {:gun_error, reason})
+  end
+
   def connecting_http(:cast, {request, _payload}, _data) when request in @user_requests do
     {:keep_state_and_data, :postpone}
+  end
+
+  def connecting_http({:call, from}, {:disconnect, nil}, data) do
+    stop_with_resume_information(from, data)
   end
 
   def connecting_ws(:enter, _from, %{conn: conn} = data) do
@@ -260,6 +320,10 @@ defmodule Nostrum.Shard.Session do
     set_timeout = {:state_timeout, @timeout_ws_upgrade, :upgrade_timeout}
     stream = :gun.ws_upgrade(conn, @gateway_qs <> compression_qs(), [], %{flow: @standard_flow})
     {:keep_state, %{data | stream: stream}, set_timeout}
+  end
+
+  def connecting_ws(:info, message, %{conn: conn}) when is_stale_gun_message(message, conn) do
+    :keep_state_and_data
   end
 
   def connecting_ws(
@@ -308,6 +372,34 @@ defmodule Nostrum.Shard.Session do
      }}
   end
 
+  # The connection went away while we were upgrading it. Connect again and
+  # resume, instead of crashing and losing the session.
+  def connecting_ws(
+        :info,
+        {:gun_down, conn, _proto, reason, _killed_streams},
+        %{conn: conn} = data
+      ) do
+    retry_connect(data, {:gun_down, reason})
+  end
+
+  def connecting_ws(:info, {:gun_error, conn, _stream, reason}, %{conn: conn} = data) do
+    retry_connect(data, {:gun_error, reason})
+  end
+
+  def connecting_ws(:info, {:gun_error, conn, reason}, %{conn: conn} = data) do
+    retry_connect(data, {:gun_error, reason})
+  end
+
+  # The gateway answered the upgrade request with a plain HTTP response
+  # instead of switching protocols (e.g. a 5xx while Discord is having issues).
+  def connecting_ws(
+        :info,
+        {:gun_response, conn, _stream, _fin, status, _headers},
+        %{conn: conn} = data
+      ) do
+    retry_connect(data, {:upgrade_rejected, status})
+  end
+
   def connecting_ws(:state_timeout, :upgrade_timeout, _data) do
     {:stop, :connect_ws_timeout}
   end
@@ -316,9 +408,21 @@ defmodule Nostrum.Shard.Session do
     {:keep_state_and_data, :postpone}
   end
 
+  def connecting_ws({:call, from}, {:disconnect, nil}, data) do
+    stop_with_resume_information(from, data)
+  end
+
   # We don't need to specially handle resuming here, because Shard.Event will
   # adjust our initial payload accordingly.
   def connected(:enter, _from, _data) do
+    :keep_state_and_data
+  end
+
+  def connected(:info, message, %{conn: conn}) when is_stale_gun_message(message, conn) do
+    Logger.debug(
+      "Received #{elem(message, 0)} message for a previous shard connection. Ignoring message."
+    )
+
     :keep_state_and_data
   end
 
@@ -389,48 +493,14 @@ defmodule Nostrum.Shard.Session do
     {:keep_state_and_data, {:next_event, :internal, :reconnect}}
   end
 
-  def connected(
-        :info,
-        {:gun_down, old_conn, _proto, _reason, _killed_streams},
-        %{conn: new_conn}
-        # technically the guard is not needed because of the above clause,
-        # but it makes the intent a bit clearer
-      )
-      when old_conn != new_conn do
-    Logger.debug("Received gun_down message for a previous shard connection. Ignoring message.")
-    :keep_state_and_data
-  end
-
   def connected(:cast, {request, payload}, %{conn: conn, stream: stream})
       when request in @user_requests do
     :ok = :gun.ws_send(conn, stream, {:binary, payload})
     :keep_state_and_data
   end
 
-  def connected({:call, from}, {:disconnect, nil}, %{
-        conn: conn,
-        shard_num: shard_num,
-        total_shards: total,
-        gateway: gateway,
-        resume_gateway: resume_gateway,
-        seq: seq,
-        session: session,
-        bot_options: bot_options
-      }) do
-    :ok = :gun.close(conn)
-    :ok = :gun.flush(conn)
-
-    {:stop_and_reply, :normal,
-     {:reply, from,
-      %{
-        shard_num: shard_num,
-        total_shards: total,
-        gateway: gateway,
-        resume_gateway: resume_gateway,
-        session: session,
-        seq: seq,
-        bot_options: bot_options
-      }}}
+  def connected({:call, from}, {:disconnect, nil}, data) do
+    stop_with_resume_information(from, data)
   end
 
   def connected(
@@ -468,19 +538,70 @@ defmodule Nostrum.Shard.Session do
       )
 
       Logger.warning("Heartbeat ack not received in time, reconnecting")
+      # Close the old connection for good. If we only sent a close frame and
+      # kept it open, its late `:gun` messages (the close reply, `:gun_down`)
+      # would reach us while we are already connecting again.
       :ok = :gun.ws_send(conn, stream, :close)
+      close_connection(conn)
       connect = {:next_event, :internal, :connect}
-      {:next_state, :disconnected, %{data | stream: nil}, connect}
+      {:next_state, :disconnected, %{data | conn: nil, stream: nil}, connect}
     end
   end
 
   # Internal event to force a complete reconnection from the connected state.
   # Useful when the gateway told us to do so.
   def connected(:internal, :reconnect, %{conn: conn} = data) do
-    :ok = :gun.close(conn)
-    :ok = :gun.flush(conn)
+    close_connection(conn)
     connect = {:next_event, :internal, :connect}
     {:next_state, :disconnected, %{data | conn: nil, stream: nil}, connect}
+  end
+
+  # Throw away the connection we were setting up and try again after a short
+  # delay. We keep `seq` and `session`, so we will RESUME instead of IDENTIFY.
+  defp retry_connect(%{conn: conn} = data, reason) do
+    Logger.warning(
+      "Shard connection failed while connecting (#{inspect(reason)}), " <>
+        "retrying in #{@retry_connect_delay}ms"
+    )
+
+    close_connection(conn)
+    retry = {:state_timeout, @retry_connect_delay, :connect}
+    {:next_state, :disconnected, %{data | conn: nil, stream: nil}, retry}
+  end
+
+  defp stop_with_resume_information(from, %{
+         conn: conn,
+         shard_num: shard_num,
+         total_shards: total,
+         gateway: gateway,
+         resume_gateway: resume_gateway,
+         seq: seq,
+         session: session,
+         bot_options: bot_options
+       }) do
+    close_connection(conn)
+
+    {:stop_and_reply, :normal,
+     {:reply, from,
+      %{
+        shard_num: shard_num,
+        total_shards: total,
+        gateway: gateway,
+        resume_gateway: resume_gateway,
+        session: session,
+        seq: seq,
+        bot_options: bot_options
+      }}}
+  end
+
+  # Close a `:gun` connection and drop the messages it already sent us. The
+  # connection may already be gone (e.g. after `:gun_down` with `retry: 0`),
+  # so `:gun.close/1` is allowed to fail here.
+  defp close_connection(nil), do: :ok
+
+  defp close_connection(conn) do
+    _ = :gun.close(conn)
+    :ok = :gun.flush(conn)
   end
 
   # :gen_statem callback helper that removes the huge zlib data blob from any
