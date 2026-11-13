@@ -252,8 +252,12 @@ defmodule Nostrum.Voice.Session do
     {:ok, state}
   end
 
-  def restart_session_async(state) do
+  def restart_session_async(%VoiceWSState{bot_options: %{name: bot_name}} = state) do
     spawn(fn ->
+      # The spawned process does not inherit the bot context from the session
+      # process, and with several bots running it cannot be inferred either.
+      Bot.set_bot_name(bot_name)
+
       Process.monitor(state.conn_pid)
 
       %VoiceState{} = voice = Voice.get_voice(state.voice_pid, state.guild_id)
