@@ -52,7 +52,8 @@ defmodule Nostrum.Voice.Event do
     Voice.update_voice_async(state.voice_pid, state.guild_id,
       secret_key: secret_key,
       rtp_sequence: 0,
-      rtp_timestamp: 0
+      rtp_timestamp: 0,
+      rtp_epoch: nil
     )
 
     Session.on_voice_ready(state.conn_pid)

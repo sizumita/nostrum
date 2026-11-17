@@ -13,6 +13,9 @@ defmodule Nostrum.Voice.Audio do
   @frames_per_burst 10
   @audio_timeout 20_000
 
+  # How many frames late the player may be before the RTP timestamp skips ahead
+  @late_frames 3
+
   # Executables
   @ffmpeg "ffmpeg"
   @ytdl "youtube-dl"
@@ -82,30 +85,61 @@ defmodule Nostrum.Voice.Audio do
     end
   end
 
-  def start_player(voice, conf) do
-    take_nap(0, conf)
-    player_loop(voice, _init? = true, conf)
-  end
+  # The player sends each frame when its RTP timestamp is due on a clock that
+  # runs in real time (`due_at/1`), and moves the timestamp forward by the
+  # time nothing was sent (`sync_clock/2`). A receiver measures how late a
+  # packet is from its timestamp: if the timestamp stood still while nothing
+  # played, the next audio would look late by the whole pause, and the
+  # receiver would keep a longer buffer from then on.
+  def start_player(voice, conf), do: player_loop(voice, _init? = true, conf)
 
-  def resume_player(voice, conf) do
-    player_loop(voice, _init? = false, conf)
-  end
+  def resume_player(voice, conf), do: player_loop(voice, _init? = false, conf)
 
   def player_loop(voice, init?, conf) do
-    t1 = Util.usec_now()
-    voice = try_send_data(voice, init?, conf)
-    t2 = Util.usec_now()
-
-    take_nap(t2 - t1, conf)
-
-    player_loop(voice, false, conf)
+    voice
+    |> wait_until_due()
+    |> try_send_data(init?, conf)
+    |> player_loop(false, conf)
   end
 
-  def take_nap(diff, conf) do
-    (Opus.usec_per_frame() * frames_per_burst(conf) - diff)
+  # Microseconds on the clock the RTP timestamps are kept on.
+  defp clock_now, do: System.monotonic_time(:microsecond)
+
+  # A timestamp counts samples at 48kHz: 6 samples are 125 microseconds.
+  defp samples_to_usec(samples), do: div(samples * 125, 6)
+
+  @doc false
+  # When the frame with the current RTP timestamp is due, on `clock_now/0`.
+  def due_at(%VoiceState{rtp_epoch: epoch, rtp_timestamp: timestamp}),
+    do: epoch + samples_to_usec(timestamp)
+
+  @doc false
+  # Brings the RTP timestamp up to `now`. A frame that is late by less than
+  # `@late_frames` keeps its timestamp: the frames after it are sent without
+  # resting until they are on time again. Later than that, nothing was sent
+  # for a while (the pause between two sounds, or a source that stalled), and
+  # the timestamp skips the frames that were due meanwhile.
+  def sync_clock(%VoiceState{rtp_epoch: nil} = voice, now),
+    do: %{voice | rtp_epoch: now - samples_to_usec(voice.rtp_timestamp)}
+
+  def sync_clock(%VoiceState{} = voice, now) do
+    late_frames = div(now - due_at(voice), Opus.usec_per_frame())
+
+    if late_frames >= @late_frames,
+      do: %{voice | rtp_timestamp: voice.rtp_timestamp + late_frames * Opus.samples_per_frame()},
+      else: voice
+  end
+
+  # Rests until the next frame is due. Nothing is due before the first frame.
+  defp wait_until_due(%VoiceState{rtp_epoch: nil} = voice), do: voice
+
+  defp wait_until_due(%VoiceState{} = voice) do
+    (due_at(voice) - clock_now())
     |> div(1_000)
     |> max(0)
     |> Process.sleep()
+
+    voice
   end
 
   def get_source(%VoiceState{ffmpeg_proc: nil, raw_audio: raw_audio}), do: raw_audio
@@ -116,16 +150,18 @@ defmodule Nostrum.Voice.Audio do
     wait = if(init?, do: audio_timeout(conf), else: 500)
     {:ok, watchdog} = :timer.apply_after(wait, __MODULE__, :on_stall, [voice, self()])
 
-    {voice, done} =
+    frames =
       voice
       |> get_source()
       |> Enum.take(frames_per_burst(conf))
-      |> send_frames(voice, conf)
+
+    # Taking the frames may have taken long: the source decides when they come.
+    {voice, done} = send_frames(frames, sync_clock(voice, clock_now()), conf)
 
     {:ok, :cancel} = :timer.cancel(watchdog)
 
     if done,
-      do: on_complete(voice, init?),
+      do: on_complete(voice, init?, conf),
       else: voice
   end
 
@@ -152,6 +188,7 @@ defmodule Nostrum.Voice.Audio do
     {Voice.update_voice(voice,
        rtp_sequence: voice.rtp_sequence,
        rtp_timestamp: voice.rtp_timestamp,
+       rtp_epoch: voice.rtp_epoch,
        # If using raw audio and it isn't stateful, update its state manually
        raw_audio:
          if not is_nil(voice.raw_audio) and not voice.raw_stateful do
@@ -278,10 +315,19 @@ defmodule Nostrum.Voice.Audio do
   end
 
   # Allow to exit here
-  @dialyzer {:nowarn_function, on_complete: 2}
-  def on_complete(%VoiceState{} = voice, timed_out) do
+  @dialyzer {:nowarn_function, on_complete: 3}
+  def on_complete(%VoiceState{} = voice, timed_out, conf) do
     voice = Voice.update_voice(voice, ffmpeg_proc: nil, raw_audio: nil)
-    Opus.generate_silence(5) |> send_frames(voice)
+
+    # The silence is sent like the audio before it, each burst when it is due.
+    voice =
+      Opus.generate_silence(5)
+      |> Enum.chunk_every(frames_per_burst(conf))
+      |> Enum.reduce(voice, fn silence, voice ->
+        {voice, _done} = send_frames(silence, wait_until_due(voice), conf)
+        voice
+      end)
+
     Voice.set_speaking(voice, false, timed_out)
     exit(:normal)
   end

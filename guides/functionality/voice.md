@@ -110,6 +110,16 @@ means that each opus frame from your audio source will be taken individually and
 player process sleeping between each; you likely won't notice a difference in audio playback quality compared to the 
 default value of `10` other than that your sub-200ms audio files will play as expected.
 
+The value also decides how soon the audio is heard. The frames of a burst are sent at once, so a listener's client
+has to hold back about one burst of audio to play it evenly, and the first burst is only sent once all of its frames
+came from the source. With `1`, each frame is sent when it is due and a listener hears it about 180 milliseconds
+sooner than with the default of `10`.
+
+Playing starts with the first burst and does not wait before it. Each burst is sent when its first frame is due on a
+clock that runs in real time, and the RTP timestamp moves on by the time nothing was sent: the pause between two
+sounds, or the time a source stalled. Without that a listener's client would take the next sound for late by the
+whole pause and hold back more audio from then on.
+
 
 ## Voice Events
 

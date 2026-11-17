@@ -24,6 +24,8 @@ defmodule Nostrum.Struct.VoiceState do
     :encryption_mode,
     :rtp_sequence,
     :rtp_timestamp,
+    # When RTP timestamp 0 was due, in microseconds of monotonic time (`Nostrum.Voice.Audio`)
+    :rtp_epoch,
     :ffmpeg_proc,
     :raw_audio,
     :raw_stateful,
